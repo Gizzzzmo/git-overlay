@@ -1,0 +1,8 @@
+[package]
+name = "git-overlay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+git2 = "0.20.2"
+
