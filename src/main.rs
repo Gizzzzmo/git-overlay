@@ -159,134 +159,152 @@ fn glob_escape_next(it: &mut Chars, re_pattern: &mut String) -> bool {
     return true;
 }
 
-fn glob_parse_range(it: &mut Chars, re_pattern: &mut String) -> bool {
-    let Some(mut prev) = it.next() else {
-        // a range must be terminated
+fn glob_parse_range_end(
+    mut range_start: char,
+    escape_start: bool,
+    mut range_end: char,
+    escape_end: bool,
+    re_pattern: &mut String,
+) -> bool {
+    if range_start > range_end {
         return false;
-    };
+    }
+    if range_start == '/' && range_end == '/' {
+        return true;
+    }
 
-    if prev == ']' {
+    if range_start == '/' {
+        range_start = '0';
+    }
+    if range_end == '/' {
+        range_end = '.';
+    }
+
+    if escape_start {
+        re_pattern.push('\\');
+    }
+    re_pattern.push(range_start);
+    re_pattern.push('-');
+
+    if range_start < '/' && range_end > '/' {
+        re_pattern.push_str(".0-");
+    }
+
+    if escape_end {
+        re_pattern.push('\\');
+    }
+    re_pattern.push(range_end);
+
+    return true;
+}
+
+/// Parses the given iterator, and pushes the corresponding regex to re_pattern, consuming all remaining
+/// characters in the iterator that correspond to the glob range.
+/// The character starting the range (and possibly an escaping backslash) must have been consumed by
+/// the iterator at this point.
+/// If the iterator is empty, or contains only exactly one more backslash '\', does nothing and returns false.
+/// Otherwise returns true.
+fn glob_parse_range(
+    range_start: char,
+    escape_start: bool,
+    it: &mut Chars,
+    re_pattern: &mut String,
+) -> bool {
+    match it.as_str().chars().next() {
+        None => false,
+        Some(']') => {
+            if escape_start {
+                re_pattern.push('\\');
+            }
+            re_pattern.push(range_start);
+            re_pattern.push('-');
+            true
+        }
+        Some('\\') => {
+            it.next();
+            if let Some(range_end) = it.next() {
+                glob_parse_range_end(range_start, escape_start, range_end, true, re_pattern)
+            } else {
+                false
+            }
+        }
+        Some(range_end) => {
+            it.next();
+            glob_parse_range_end(range_start, escape_start, range_end, false, re_pattern)
+        }
+    }
+}
+
+/// Parses a glob-range-expression, and creates the corresponding regex pushing it to re_pattern.
+/// The starting opening bracket must have already been consumed by the iterator.
+/// Returns true if the iterator starts with a valid glob-range-expression.
+/// Otherwise returns false, in which case re_pattern may or may not have been written to.
+/// A valid glob-range-expression must be terminated by an unescaped closing bracket ']'.
+fn glob_parse_brackets(it: &mut Chars, re_pattern: &mut String) -> bool {
+    let peek_first = it.as_str().chars().next();
+    if peek_first == Some(']') {
         // a range must contain at least one character
         return false;
     }
-
-    let mut escape_prev = false;
-
-    if prev == '\\' {
-        let Some(new_prev) = it.next() else {
-            return false; // a backslash must escape something
-        };
-        escape_prev = true;
-        prev = new_prev;
-    }
     re_pattern.push('[');
 
-    let mut prev_done = false;
-    let finish_prev = |prev_done: bool, escape_prev: bool, prev: char, re_pattern: &mut String| {
-        if !prev_done {
-            if escape_prev {
-                re_pattern.push('\\');
-            }
-            re_pattern.push(prev);
-        }
-    };
+    if peek_first == Some('^') {
+        it.next();
+        re_pattern.push('^');
+    }
 
     while let Some(c) = it.next() {
         match c {
-            '\\' => {
-                let Some(esc) = it.next() else {
-                    return false; // a backslash must escape something
-                };
-                prev = esc;
-                escape_prev = true;
-            }
-            '-' => {
-                let Some(mut range_end) = it.next() else {
-                    return false; // a range must be terminated
-                };
-                let mut escape_end = false;
-                match range_end {
-                    ']' => {
-                        finish_prev(prev_done, escape_prev, prev, re_pattern);
-                        re_pattern.push_str("-]");
-                        return true;
-                    }
-                    '\\' => {
-                        escape_end = true;
-                        let Some(new_end) = it.next() else {
-                            return false; // a backslash must escape something
-                        };
-                        range_end = new_end;
-                    }
-                    _ => {}
-                }
-                if range_end < prev {
-                    return false;
-                }
-                if range_end == '/' && prev == '/' {
-                    continue;
-                }
-                if prev == '/' {
-                    prev = '0';
-                }
-                if escape_prev {
-                    re_pattern.push('\\');
-                }
-                re_pattern.push(prev);
-                re_pattern.push('-');
-                if prev < '/' && '/' < range_end {
-                    re_pattern.push_str(".0-");
-                } else if range_end == '/' {
-                    range_end = '.';
-                }
-
-                if escape_end {
-                    re_pattern.push('\\');
-                }
-                re_pattern.push(range_end);
-                prev_done = true;
-            }
             ']' => {
-                finish_prev(prev_done, escape_prev, prev, re_pattern);
                 re_pattern.push(']');
                 return true;
             }
-            _ => {
-                finish_prev(prev_done, escape_prev, prev, re_pattern);
-                prev = c;
-                escape_prev = false;
-                prev_done = false;
+            '\\' => {
+                let Some(next) = it.next() else {
+                    // a backslash must escape something
+                    return false;
+                };
+                if it.as_str().chars().next() == Some('-') {
+                    it.next();
+                    if !glob_parse_range(next, true, it, re_pattern) {
+                        return false;
+                    }
+                } else {
+                    re_pattern.push('\\');
+                    re_pattern.push(next);
+                }
+            }
+            c => {
+                if it.as_str().chars().next() == Some('-') {
+                    it.next();
+                    if !glob_parse_range(c, false, it, re_pattern) {
+                        return false;
+                    }
+                } else {
+                    re_pattern.push(c);
+                }
             }
         }
     }
-    return false; // a range must be terminated
+    return false;
 }
 
 fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
     let mut re_pattern = String::new();
     re_pattern.reserve(pattern.len());
     let mut it = pattern.chars();
-    let mut first = it.next();
-    let mut second = it.next();
-    let mut third = it.next();
-    let fourth = it.next();
-
-    let mut it = pattern.chars();
 
     let mut had_separator = false;
+    let mut beginning = &pattern[..pattern.len().min(3)];
 
-    if first == Some('/') {
+    if pattern.chars().next() == Some('/') {
         had_separator = true;
         it.next();
-        first = second;
-        second = third;
-        third = fourth;
+        beginning = &pattern[1..pattern.len().min(4)];
     }
 
-    if first == Some('*') && second == Some('*') && third == Some('/') {
-        it.next();
-        it.next();
-        it.next();
+    if beginning == "**/" {
+        it.nth(2);
         re_pattern.push_str("(.*/|)");
         had_separator = true;
     }
@@ -302,12 +320,10 @@ fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
         match c {
             '/' => {
                 had_separator = true;
-                let mut peek_it = it.as_str().chars();
-                let first = peek_it.next();
-                let second = peek_it.next();
-                let third = peek_it.next();
+                let peek_str = it.as_str().chars().as_str();
+                let next_three = &peek_str[..peek_str.len().min(3)];
 
-                if first != Some('*') || second != Some('*') || !matches!(third, None | Some('/')) {
+                if next_three != "**" && next_three != "**/" {
                     count += c.len_utf8();
                     continue;
                 }
@@ -318,19 +334,17 @@ fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
                 }
 
                 re_pattern.push_str("/.*");
-                if third == None {
+                if next_three == "**" {
                     only_files = true;
                     break;
                 }
                 re_pattern.push('/');
-                it.next();
-                it.next();
-                it.next();
+                it.nth(2);
             }
             '*' => re_pattern.push_str("[^/]*"),
             '?' => re_pattern.push_str("[^/]"),
             '[' => {
-                if !glob_parse_range(&mut it, &mut re_pattern) {
+                if !glob_parse_brackets(&mut it, &mut re_pattern) {
                     return None;
                 }
             }
