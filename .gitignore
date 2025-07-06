@@ -2,3 +2,6 @@
 .direnv
 .overlayignore
 testignore
+.opencode
+CLAUDE.md
+CONTEXT.md
