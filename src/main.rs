@@ -1,8 +1,7 @@
 use clap::{Parser, Subcommand};
-use git2::{IndexEntry, Oid, Repository, RepositoryInitOptions, RepositoryOpenFlags, Signature};
+use git2::{Repository, RepositoryInitOptions, RepositoryOpenFlags};
 use pathdiff::diff_paths;
 use regex::{escape, Regex};
-use subenum::subenum;
 use trie_rs::inc_search::{Answer, IncSearch};
 use trie_rs::TrieBuilder;
 
@@ -10,9 +9,10 @@ use std::env::current_dir;
 use std::fs::{self, File};
 use std::hint::unreachable_unchecked;
 use std::io::{self, BufRead};
+#[cfg(not(unix))]
 use std::marker::PhantomData;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{absolute, Component, Path, PathBuf};
 use std::str::{Chars, FromStr};
 
@@ -50,10 +50,9 @@ enum Commands {
     /// Commit changes to overlay repository
     CommitHook {},
     /// Checkout and synchronize overlay files
-    PostCheckoutHook { 
-        target: String, 
-        prev: String, 
-
+    PostCheckoutHook {
+        target: String,
+        prev: String,
         // branch: bool
     },
     /// Push overlay repositories
@@ -83,7 +82,9 @@ fn main() {
         Commands::Import { url, path } => import_overlay(url, path),
         Commands::Add { paths } => add_to_overlay(paths),
         Commands::CommitHook {} => commit_hook(),
-        Commands::PostCheckoutHook { target, prev, } => post_checkout_hook(&target, &prev, true),
+        Commands::PostCheckoutHook { target, prev } => {
+            post_checkout_hook(&target, &prev, true).unwrap();
+        }
         Commands::Push { remote } => push_overlay(remote),
         Commands::Fetch { remote } => fetch_overlay(remote),
         Commands::Status => show_status(),
@@ -130,7 +131,7 @@ fn init_overlay_impl(remote: Option<String>) -> Result<(), Box<dyn std::error::E
 
     // Initialize the overlay repository
     let mut init_opts = RepositoryInitOptions::new();
-    init_opts.bare(false);
+    init_opts.bare(true);
     let overlay_repo = Repository::init_opts(&overlay_path, &init_opts)?;
 
     // Set up remote if provided
@@ -615,9 +616,6 @@ fn git_style_path_to_path(path: GitPathRef) -> PathBuf {
 #[cfg(unix)]
 fn path_to_git_style_path(path: &Path) -> GitPathRef {
     GitPathRef::from(path.as_os_str().as_bytes())
-    // .iter()
-    // .map(|b| *b)
-    // .collect::<Vec<u8>>()
 }
 
 impl GitOverlay {
@@ -636,10 +634,6 @@ impl GitOverlay {
             base_repo,
             overlay_repo: Repository::open(overlay_path)?,
         };
-
-        // if overlay.overlay_repo.is_bare() {
-        //     return Err(GitOverlayError::BareOverlay);
-        // }
 
         return Ok(overlay);
     }
@@ -827,9 +821,11 @@ impl GitOverlay {
         );
         println!("All files:");
         let mut index = self.overlay_repo.index()?;
-        for (git_path, file)  in &matching_files {
+        for (git_path, file) in &matching_files {
             println!(
-                "{}\n{}", std::str::from_utf8(git_path).unwrap(), file.to_str().unwrap()
+                "{}\n{}",
+                std::str::from_utf8(git_path).unwrap(),
+                file.to_str().unwrap()
             );
 
             add_to_index(&mut index, GitPathRef::from(git_path.as_slice()), file);
@@ -839,11 +835,15 @@ impl GitOverlay {
     }
 }
 
-fn add_to_index(index: &mut git2::Index, git_path: GitPathRef, file: &Path) {
+fn add_to_index(
+    index: &mut git2::Index,
+    git_path: GitPathRef,
+    file: &Path,
+) -> Result<(), GitOverlayError> {
     // Read file contents into memory
-    let file_contents = std::fs::read(file).expect("Failed to read file");
-    
-    let metadata = std::fs::metadata(file).expect("Failed to get file metadata");
+    let file_contents = std::fs::read(file)?;
+
+    let metadata = std::fs::metadata(file)?;
 
     #[cfg(unix)]
     let entry = {
@@ -855,16 +855,19 @@ fn add_to_index(index: &mut git2::Index, git_path: GitPathRef, file: &Path) {
             mode: metadata.mode(),
             uid: metadata.uid(),
             gid: metadata.gid(),
-            file_size: 0, // Will be calculated by git2
+            file_size: 0,          // Will be calculated by git2
             id: git2::Oid::zero(), // Will be calculated by libgit2
             flags: 0,
             flags_extended: 0,
-            path: git_path.to_owned()
+            path: git_path.to_owned(),
         }
     };
-    
+
     // Add the file to the index using its contents
-    index.add_frombuffer(&entry, &file_contents).expect("Failed to add file to index");
+    index
+        .add_frombuffer(&entry, &file_contents)
+        .expect("Failed to add file to index");
+    Ok(())
 }
 
 fn ls_files_overlay(paths: Vec<PathBuf>) {
@@ -989,53 +992,19 @@ fn commit_hook() {
     );
 }
 
-fn sync_overlay_to_base(overlay: &GitOverlay) -> Result<(), GitOverlayError> {
-    let overlay_workdir = overlay.overlay_repo.workdir()
-        .ok_or_else(|| GitOverlayError::Git2Error(git2::Error::from_str("Overlay repository has no working directory")))?;
-    let base_workdir = overlay.base_root();
-    
-    // Get all files in the overlay index
-    let overlay_index = overlay.overlay_repo.index()?;
-    
-    for entry in overlay_index.iter() {
-        let overlay_file_path = git_style_path_to_path(GitPathRef::from(&entry.path));
-        let source_path = overlay_workdir.join(&overlay_file_path);
-        let dest_path = base_workdir.join(&overlay_file_path);
-        
-        // Create parent directories if they don't exist
-        if let Some(parent) = dest_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        
-        // Copy the file from overlay to base working directory
-        if source_path.exists() {
-            fs::copy(&source_path, &dest_path)?;
-            println!("Synced: {}", overlay_file_path.display());
-        }
-    }
-    
-    Ok(())
-}
+fn post_checkout_hook(target: &str, prev: &str, branch: bool) -> Result<(), GitOverlayError> {
+    let overlay = GitOverlay::open(".").unwrap();
 
-fn post_checkout_hook(target: &str, prev: &str, branch: bool) -> Result<(), GitOverlayError>{
-    let overlay = GitOverlay::open(".")?;
-    
     // Find the overlay commit associated with the target base commit
     let tag_name = format!("refs/tags/{}", target);
-    let overlay_commit = match overlay.overlay_repo.find_reference(&tag_name) {
-        Ok(reference) => {
-            let object = reference.peel(git2::ObjectType::Commit)?;
-            Some(object.into_commit().map_err(|_| git2::Error::from_str("Not a commit"))?)
-        }
-        Err(_) => {
-            // No overlay commit found for this base commit
-            println!("No overlay commit found for base commit {}", target);
-            return Ok(());
-        }
-    };
-    
+    let reference = overlay.overlay_repo.find_reference(&tag_name)?;
+    let object = reference.peel(git2::ObjectType::Commit)?;
+    let commit = object
+        .into_commit()
+        .map_err(|_| git2::Error::from_str("Not a commit"))?;
+
     // walk the commit's tree and write the trees files into the base repo
-    
+
     Ok(())
 }
 
