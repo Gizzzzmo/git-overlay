@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use git2::{Repository, RepositoryInitOptions, RepositoryOpenFlags};
+use git2::{Repository, RepositoryOpenFlags};
 use pathdiff::diff_paths;
 use regex::Regex;
 use trie_rs::inc_search::{Answer, IncSearch};
@@ -15,6 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{absolute, Component, Path, PathBuf};
 use std::str::FromStr;
+
 mod glob_to_regex;
 use glob_to_regex::glob_to_regex;
 
@@ -41,8 +42,6 @@ enum Commands {
     Import {
         /// URL of the overlay repository to import
         url: String,
-        /// Optional path to clone into (defaults to .git/overlay)
-        path: Option<PathBuf>,
     },
     /// Add files to the overlay repository
     Add {
@@ -71,9 +70,8 @@ enum Commands {
     },
     /// Show status of both base and overlay repositories
     Status,
-    LsFiles {
-        paths: Vec<PathBuf>,
-    },
+    /// List all files in the overlay's index, underneath the given paths
+    LsFiles { paths: Vec<PathBuf> },
 }
 
 fn main() {
@@ -81,7 +79,7 @@ fn main() {
 
     match cli.command {
         Commands::Init { remote } => init_overlay(remote),
-        Commands::Import { url, path } => import_overlay(url, path),
+        Commands::Import { url } => import_overlay(url),
         Commands::Add { paths } => add_to_overlay(paths),
         Commands::CommitHook {} => commit_hook(),
         Commands::PostCheckoutHook { target, prev } => {
@@ -96,64 +94,20 @@ fn main() {
 
 fn add_to_overlay(paths: Vec<PathBuf>) {
     let overlay = GitOverlay::open(".").unwrap();
-
     overlay.add_to_overlay(paths).unwrap();
 }
 
+fn ls_files_overlay(paths: Vec<PathBuf>) {
+    let overlay = GitOverlay::open(".").unwrap();
+    overlay.ls_files_overlay(paths).unwrap();
+}
+
 fn init_overlay(remote: Option<String>) {
-    match init_overlay_impl(remote) {
-        Ok(_) => println!("Successfully initialized overlay repository"),
-        Err(e) => {
-            eprintln!("Error initializing overlay repository: {}", e);
-            std::process::exit(1);
-        }
-    }
+    GitOverlay::init(".", remote.as_ref().map(|url| (url.as_str(), false))).unwrap();
 }
 
-fn init_overlay_impl(remote: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    // Check if we're in a git repository
-    let base_repo = Repository::open(".")?;
-    let git_dir = base_repo.path();
-
-    // Create overlay directory path
-    let overlay_path = git_dir.join("overlay");
-
-    // Check if overlay already exists
-    if overlay_path.exists() {
-        return Err(
-            "Overlay repository already exists. Use 'git-overlay status' to check its state."
-                .into(),
-        );
-    }
-
-    println!("Initializing overlay repository in {:?}...", overlay_path);
-
-    // Create the overlay directory
-    fs::create_dir_all(&overlay_path)?;
-
-    // Initialize the overlay repository
-    let mut init_opts = RepositoryInitOptions::new();
-    init_opts.bare(true);
-    let overlay_repo = Repository::init_opts(&overlay_path, &init_opts)?;
-
-    // Set up remote if provided
-    if let Some(url) = remote {
-        println!("Adding remote 'origin' with URL: {}", url);
-        overlay_repo.remote("origin", &url)?;
-    }
-
-    Ok(())
-}
-
-fn import_overlay(url: String, path: Option<PathBuf>) {
-    println!("Cloning overlay repository from: {}", url);
-    if let Some(p) = path {
-        println!("Into path: {:?}", p);
-    }
-    // TODO: Clone overlay repo and set up in .git/overlay
-}
-}
-
+fn import_overlay(url: String) {
+    GitOverlay::init(".", Some((url.as_str(), true))).unwrap();
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
@@ -298,8 +252,6 @@ enum GitOverlayError {
     IoError(io::Error),
     /// Base Repository is bare
     BareBase,
-    /// Overlay Repository is bare
-    BareOverlay,
     /// Overlay already exists
     OverlayExists,
     /// Path is outside both the base and the overlay repository
@@ -383,6 +335,44 @@ fn path_to_git_style_path(path: &Path) -> GitPathRef {
 }
 
 impl GitOverlay {
+    fn init<P: AsRef<Path>>(
+        base_repo: P,
+        remote_url_and_pull: Option<(&str, bool)>,
+    ) -> Result<GitOverlay, GitOverlayError> {
+        let base_repo = Repository::open_ext(
+            base_repo,
+            RepositoryOpenFlags::CROSS_FS,
+            &[] as &[&std::ffi::OsStr],
+        )?;
+        let overlay_path = base_repo.path().join("overlay");
+        if base_repo.is_bare() {
+            return Err(GitOverlayError::BareBase);
+        }
+
+        let Err(_) = Repository::open(&overlay_path) else {
+            return Err(GitOverlayError::OverlayExists);
+        };
+
+        std::fs::create_dir_all(&overlay_path)?;
+
+        let overlay = GitOverlay {
+            base_repo,
+            overlay_repo: Repository::init_bare(overlay_path)?,
+        };
+
+        let Some((remote_url, pull)) = remote_url_and_pull else {
+            return Ok(overlay);
+        };
+
+        let mut remote = overlay.overlay_repo.remote("origin", remote_url)?;
+        if pull {
+            remote.fetch(&[] as &[&str], None, None)?;
+            // overlay.post_checkout_hook();
+        }
+        drop(remote);
+        return Ok(overlay);
+    }
+
     fn open<P: AsRef<Path>>(base_repo: P) -> Result<GitOverlay, GitOverlayError> {
         let base_repo = Repository::open_ext(
             base_repo,
@@ -401,7 +391,6 @@ impl GitOverlay {
 
         return Ok(overlay);
     }
-    fn import(base_repo: &PathBuf, remote_url: &str) {}
 
     /// Get the path to the root directory of the base repository
     fn base_root(&self) -> &Path {
@@ -592,10 +581,91 @@ impl GitOverlay {
                 file.to_str().unwrap()
             );
 
-            add_to_index(&mut index, GitPathRef::from(git_path.as_slice()), file);
+            add_to_index(&mut index, GitPathRef::from(git_path.as_slice()), file)?;
         }
         index.write()?;
         Ok(())
+    }
+
+    fn ls_files_overlay(&self, mut paths: Vec<PathBuf>) -> Result<(), GitOverlayError> {
+        if paths.len() == 0 {
+            paths.push(PathBuf::from_str(".").unwrap());
+        }
+        let Ok(repo) = Repository::open_ext(
+            ".",
+            RepositoryOpenFlags::CROSS_FS,
+            &[] as &[&std::ffi::OsStr],
+        ) else {
+            println!("Error: Not a git repository");
+            return Ok(());
+        };
+        let Some(workdir) = repo.workdir() else {
+            println!("Error: Repository has no workdir (likely bare)");
+            return Ok(());
+        };
+        let workdir = normalize_path(workdir);
+        let git_dir = repo.path();
+        let Ok(overlay_repo) = Repository::open(git_dir.join("overlay")) else {
+            println!("Error: No overlay exists");
+            return Ok(());
+        };
+        let cwd = current_dir().unwrap();
+        let mut builder = TrieBuilder::new();
+
+        let mut everything = false;
+        for path in paths {
+            let relative = diff_paths(
+                normalize_path(absolute(cwd.join(path)).unwrap().as_path()),
+                &workdir,
+            )
+            .unwrap();
+            let relative = relative.to_str().unwrap();
+
+            if relative == "" {
+                everything = true;
+                break;
+            }
+            builder.push(relative);
+        }
+
+        let trie = builder.build();
+        for entry in overlay_repo.index().unwrap().iter() {
+            let components_iter = entry.path.split(|b| *b == b'/');
+
+            let mut search = trie.inc_search();
+            let mut found = everything;
+            for component in components_iter {
+                if everything {
+                    break;
+                }
+                // println!("check {}", std::str::from_utf8(component).unwrap());
+                match search.query_until(component) {
+                    Ok(Answer::Match) | Ok(Answer::PrefixAndMatch) => {
+                        // println!("found {}", std::str::from_utf8(&entry.path).unwrap());
+                        found = true;
+                        break;
+                    }
+                    Ok(Answer::Prefix) => {
+                        _ = search.query_until(std::path::MAIN_SEPARATOR_STR);
+                    }
+                    _ => break,
+                }
+            }
+
+            if found {
+                let relative = entry
+                    .path
+                    .split(|b| *b == b'/')
+                    .map(|sl| std::str::from_utf8(sl).unwrap())
+                    .collect::<Vec<&str>>()
+                    .join(std::path::MAIN_SEPARATOR_STR);
+
+                let abs = workdir.join(PathBuf::from_str(&relative).unwrap());
+
+                println!("{}", diff_paths(abs, &cwd).unwrap().to_str().unwrap());
+            }
+        }
+        return Ok(());
     }
 }
 
