@@ -1,6 +1,13 @@
 use regex::{escape, Regex};
 use std::str::{Chars, FromStr};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MatchTarget {
+    All,       // Match both files and directories (default case)
+    OnlyFiles, // Match only files (for patterns ending with **)
+    OnlyDirs,  // Match only directories (for patterns ending with /)
+}
+
 fn glob_escape_next(it: &mut Chars, re_pattern: &mut String) -> bool {
     let view = it.as_str();
     let Some(_) = it.next() else {
@@ -131,10 +138,12 @@ fn glob_parse_brackets(it: &mut Chars, re_pattern: &mut String) -> bool {
 
 /// Turns a prefix string and a valid glob pattern into the corresponding regular expression
 /// that matches what the glob pattern would match relative to the prefix string.
-/// Also returns a bool that is true when the pattern ended in two asterisks
-/// (in which case it should only matched against files, not directories).
+/// Also returns a MatchTarget indicating what types of filesystem entries should be matched:
+/// - MatchTarget::All: Match both files and directories (default)
+/// - MatchTarget::OnlyFiles: Match only files (for patterns ending with **)
+/// - MatchTarget::OnlyDirs: Match only directories (for patterns ending with /)
 /// Invalid glob patterns will return None.
-pub fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
+pub fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, MatchTarget)> {
     let mut re_pattern = String::new();
     re_pattern.reserve(pattern.len());
     let mut it = pattern.chars();
@@ -148,6 +157,10 @@ pub fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
         beginning = &pattern[1..pattern.len().min(4)];
     }
 
+    if beginning == "" {
+        return None;
+    }
+
     if beginning == "**/" {
         it.nth(2);
         re_pattern.push_str("(.*/|)");
@@ -156,7 +169,7 @@ pub fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
 
     let mut last_pos: &str = it.as_str();
     let mut count = 0;
-    let mut only_files = false;
+    let mut match_target = MatchTarget::All;
     while let Some(c) = it.next() {
         if count > 0 && matches!(c, '*' | '?' | '[' | '\\') {
             re_pattern.push_str(&escape(&last_pos[..count]));
@@ -164,9 +177,14 @@ pub fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
         }
         match c {
             '/' => {
-                had_separator = true;
                 let peek_str = it.as_str().chars().as_str();
                 let next_three = &peek_str[..peek_str.len().min(3)];
+
+                if next_three == "" {
+                    match_target = MatchTarget::OnlyDirs;
+                    break;
+                }
+                had_separator = true;
 
                 if next_three != "**" && next_three != "**/" {
                     count += c.len_utf8();
@@ -180,7 +198,7 @@ pub fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
 
                 re_pattern.push_str("/.*");
                 if next_three == "**" {
-                    only_files = true;
+                    match_target = MatchTarget::OnlyFiles;
                     break;
                 }
                 re_pattern.push('/');
@@ -206,6 +224,7 @@ pub fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
         last_pos = it.as_str();
     }
 
+    // Handle remaining characters, but skip trailing slash if it's for OnlyDirs
     if count > 0 {
         re_pattern.push_str(&escape(&last_pos[..count]));
     }
@@ -233,7 +252,7 @@ pub fn glob_to_regex(pattern: &str, prefix: &str) -> Option<(Regex, bool)> {
     full_pattern.push_str(&re_pattern);
     full_pattern.push('$');
 
-    return Some((Regex::new(&full_pattern).unwrap(), only_files));
+    return Some((Regex::new(&full_pattern).unwrap(), match_target));
 }
 
 #[cfg(test)]
@@ -252,6 +271,34 @@ mod tests {
         let re_pattern = regex.as_ref().map(|(re, _)| re.as_str());
 
         assert_eq!(re_pattern, expected_re);
+    }
+
+    fn assert_glob_is_regex_and_target(
+        glob: &str,
+        expected_re: Option<&str>,
+        expected_target: Option<MatchTarget>,
+    ) {
+        let result = glob_to_regex(glob, "");
+        match (result, expected_re, expected_target) {
+            (Some((regex, target)), Some(expected_re), Some(expected_target)) => {
+                assert_eq!(
+                    regex.as_str(),
+                    expected_re,
+                    "Regex mismatch for pattern '{}'",
+                    glob
+                );
+                assert_eq!(
+                    target, expected_target,
+                    "MatchTarget mismatch for pattern '{}'",
+                    glob
+                );
+            }
+            (None, None, None) => {} // Both expect None
+            _ => panic!(
+                "Mismatch between expected and actual result for pattern '{}'",
+                glob
+            ),
+        }
     }
 
     #[test]
@@ -311,5 +358,66 @@ mod tests {
 
         // glob escaping
         assert_glob_is_regex("/\\blub", Some("^blub$"));
+
+        assert_glob_is_regex("/", None);
+    }
+
+    #[test]
+    fn glob_to_regex_match_targets() {
+        use MatchTarget::*;
+
+        // Test All (default behavior)
+        assert_glob_is_regex_and_target("blub", Some("^(.*/|)blub$"), Some(All));
+        assert_glob_is_regex_and_target("src/main.rs", Some("^src/main\\.rs$"), Some(All));
+        assert_glob_is_regex_and_target("*.txt", Some("^(.*/|)[^/]*\\.txt$"), Some(All));
+        assert_glob_is_regex_and_target("foo", Some("^(.*/|)foo$"), Some(All));
+
+        // Test OnlyDirs (trailing slash)
+        assert_glob_is_regex_and_target("build/", Some("^(.*/|)build$"), Some(OnlyDirs));
+        assert_glob_is_regex_and_target("/temp/", Some("^temp$"), Some(OnlyDirs));
+        assert_glob_is_regex_and_target(
+            "node_modules/",
+            Some("^(.*/|)node_modules$"),
+            Some(OnlyDirs),
+        );
+        assert_glob_is_regex_and_target("src/target/", Some("^src/target$"), Some(OnlyDirs));
+        assert_glob_is_regex_and_target("a/", Some("^(.*/|)a$"), Some(OnlyDirs));
+
+        // Test OnlyFiles (ending with **)
+        assert_glob_is_regex_and_target("build/**", Some("^build/.*$"), Some(OnlyFiles));
+        assert_glob_is_regex_and_target("temp/**", Some("^temp/.*$"), Some(OnlyFiles));
+        assert_glob_is_regex_and_target("/logs/**", Some("^logs/.*$"), Some(OnlyFiles));
+        assert_glob_is_regex_and_target("blab/blub/**", Some("^blab/blub/.*$"), Some(OnlyFiles));
+
+        // Test that /** patterns don't trigger OnlyDirs (should be OnlyFiles)
+        assert_glob_is_regex_and_target("src/**", Some("^src/.*$"), Some(OnlyFiles));
+
+        // Test that **/pattern doesn't trigger OnlyFiles (should be All)
+        assert_glob_is_regex_and_target("**/build", Some("^(.*/|)build$"), Some(All));
+        assert_glob_is_regex_and_target("**/src/main.rs", Some("^(.*/|)src/main\\.rs$"), Some(All));
+
+        // Bracket expressions should remain All unless they have trailing slash
+        assert_glob_is_regex_and_target("[a-z]/", Some("^(.*/|)[a-z]$"), Some(OnlyDirs));
+        assert_glob_is_regex_and_target("[a-z]", Some("^(.*/|)[a-z]$"), Some(All));
+        assert_glob_is_regex_and_target("/[a-z]/", Some("^[a-z]$"), Some(OnlyDirs));
+        assert_glob_is_regex_and_target("/[a-z]", Some("^[a-z]$"), Some(All));
+    }
+
+    #[test]
+    fn glob_to_regex_existing_tests_with_targets() {
+        use MatchTarget::*;
+
+        // Update some existing tests to also verify MatchTarget
+        assert_glob_is_regex_and_target("blub", Some("^(.*/|)blub$"), Some(All));
+        assert_glob_is_regex_and_target("/blub", Some("^blub$"), Some(All));
+        assert_glob_is_regex_and_target("**/blub", Some("^(.*/|)blub$"), Some(All));
+        assert_glob_is_regex_and_target("blab/blub/**", Some("^blab/blub/.*$"), Some(OnlyFiles));
+
+        // Test patterns with wildcards and trailing slash
+        assert_glob_is_regex_and_target("*/", Some("^(.*/|)[^/]*$"), Some(OnlyDirs));
+        assert_glob_is_regex_and_target("src/*/", Some("^src/[^/]*$"), Some(OnlyDirs));
+
+        // Test that escaped slashes don't trigger OnlyDirs
+        assert_glob_is_regex_and_target("test\\/", Some("^(.*/|)test/$"), Some(All));
     }
 }

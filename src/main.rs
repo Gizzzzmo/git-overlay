@@ -17,7 +17,7 @@ use std::path::{absolute, Component, Path, PathBuf};
 use std::str::FromStr;
 
 mod glob_to_regex;
-use glob_to_regex::glob_to_regex;
+use glob_to_regex::{glob_to_regex, MatchTarget};
 
 #[derive(Parser, Debug)]
 #[command(name = "git-overlay")]
@@ -161,7 +161,7 @@ fn parse_pattern_file(input: io::Lines<io::BufReader<File>>) -> Vec<(String, boo
     return result;
 }
 
-fn regexes_from_pattern_file(path: PathBuf, prefix: &str) -> Vec<(Regex, bool, bool)> {
+fn regexes_from_pattern_file(path: PathBuf, prefix: &str) -> Vec<(Regex, bool, MatchTarget)> {
     let mut regexes = Vec::new();
 
     if let Ok(lines) = read_lines(path) {
@@ -170,9 +170,9 @@ fn regexes_from_pattern_file(path: PathBuf, prefix: &str) -> Vec<(Regex, bool, b
         //     println!("  {} {}", pat, negate);
         // }
         for (glob_pattern, negate) in glob_patterns {
-            if let Some((regex, only_files)) = glob_to_regex(&glob_pattern, &prefix) {
+            if let Some((regex, match_target)) = glob_to_regex(&glob_pattern, &prefix) {
                 // println!("  regex: {}", regex.as_str());
-                regexes.push((regex, negate, only_files));
+                regexes.push((regex, negate, match_target));
             }
         }
     }
@@ -181,9 +181,9 @@ fn regexes_from_pattern_file(path: PathBuf, prefix: &str) -> Vec<(Regex, bool, b
 }
 
 fn join_regex_slices<'a>(
-    base: &[&'a (Regex, bool, bool)],
-    additional: &'a [(Regex, bool, bool)],
-) -> Vec<&'a (Regex, bool, bool)> {
+    base: &[&'a (Regex, bool, MatchTarget)],
+    additional: &'a [(Regex, bool, MatchTarget)],
+) -> Vec<&'a (Regex, bool, MatchTarget)> {
     let mut combined = Vec::new();
     if additional.len() > 0 {
         for pat in base {
@@ -196,13 +196,17 @@ fn join_regex_slices<'a>(
     return combined;
 }
 
-fn path_matches(path: &str, patterns: &[&(Regex, bool, bool)], is_dir: bool) -> bool {
+fn path_matches(path: &str, patterns: &[&(Regex, bool, MatchTarget)], is_dir: bool) -> bool {
     let mut matches = false;
-    for (regex, negate, only_files) in patterns {
+    for (regex, negate, match_target) in patterns {
         if matches != *negate {
             continue;
         }
-        if is_dir && *only_files {
+        // Skip pattern if it doesn't match the current path type
+        if *match_target == MatchTarget::OnlyFiles && is_dir {
+            continue;
+        }
+        if *match_target == MatchTarget::OnlyDirs && !is_dir {
             continue;
         }
         if regex.is_match(path) {
@@ -423,8 +427,8 @@ impl GitOverlay {
         &self,
         dir: &Path,
         git_path: GitPathRef,
-        patterns_ignore: Option<&[&(Regex, bool, bool)]>,
-        patterns_overlay: &[&(Regex, bool, bool)],
+        patterns_ignore: Option<&[&(Regex, bool, MatchTarget)]>,
+        patterns_overlay: &[&(Regex, bool, MatchTarget)],
         trie_search: &Option<IncSearch<u8, ()>>,
     ) -> Vec<(Vec<u8>, PathBuf)> {
         let git_path = std::str::from_utf8(git_path.to_bytes()).unwrap();
@@ -441,7 +445,7 @@ impl GitOverlay {
             Some(patterns_ignore) => join_regex_slices(patterns_ignore, &new_patterns_ignore),
         };
 
-        let mut all_patterns_ignore: Option<&[&(Regex, bool, bool)]> = None;
+        let mut all_patterns_ignore: Option<&[&(Regex, bool, MatchTarget)]> = None;
         if let Some(patterns_ignore) = patterns_ignore {
             if new_patterns_ignore.len() > 0 {
                 all_patterns_ignore = Some(&joined);
