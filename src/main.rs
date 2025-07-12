@@ -6,7 +6,7 @@ use trie_rs::inc_search::{Answer, IncSearch};
 use trie_rs::TrieBuilder;
 
 use std::env::current_dir;
-use std::fs::{self, File};
+use std::fs::File;
 use std::hint::unreachable_unchecked;
 use std::io::{self, BufRead};
 #[cfg(not(unix))]
@@ -81,7 +81,7 @@ fn main() {
         Commands::Init { remote } => init_overlay(remote),
         Commands::Import { url } => import_overlay(url),
         Commands::Add { paths } => add_to_overlay(paths),
-        Commands::CommitHook {} => commit_hook(),
+        Commands::CommitHook {} => post_commit(),
         Commands::PostCheckoutHook { target, prev } => {
             post_checkout_hook(&target, &prev, true).unwrap();
         }
@@ -94,12 +94,12 @@ fn main() {
 
 fn add_to_overlay(paths: Vec<PathBuf>) {
     let overlay = GitOverlay::open(".").unwrap();
-    overlay.add_to_overlay(paths).unwrap();
+    overlay.add(paths).unwrap();
 }
 
 fn ls_files_overlay(paths: Vec<PathBuf>) {
     let overlay = GitOverlay::open(".").unwrap();
-    overlay.ls_files_overlay(paths).unwrap();
+    overlay.ls_files(paths).unwrap();
 }
 
 fn init_overlay(remote: Option<String>) {
@@ -251,15 +251,15 @@ struct GitOverlay {
 
 // #[subenum(OpenError)]
 #[derive(Debug)]
-enum GitOverlayError {
+pub enum GitOverlayError {
     Git2Error(git2::Error),
     IoError(io::Error),
     /// Base Repository is bare
     BareBase,
     /// Overlay already exists
     OverlayExists,
-    /// Path is outside both the base and the overlay repository
-    PathOutsideRepos,
+    /// Path is outside the repository
+    PathOutsideRepo,
 }
 
 impl From<io::Error> for GitOverlayError {
@@ -404,12 +404,16 @@ impl GitOverlay {
         };
     }
 
+    /// Get a normalized git-style path (relative to the root of the base repo of this overlay)
+    /// to the given path.
+    /// Returns GitOverlayError::PathOutsideRepo if the path does not lie under the base_repo of
+    /// this overlay.
     fn normal_git_path(&self, path: &Path) -> Result<Vec<u8>, GitOverlayError> {
         let path = normalize_path(absolute(path)?.as_path());
         let relative_path = if path.starts_with(self.base_root()) {
             diff_paths(path, self.base_root())
         } else {
-            return Err(GitOverlayError::PathOutsideRepos);
+            return Err(GitOverlayError::PathOutsideRepo);
         };
         let relative_path = match relative_path {
             Some(path) => path,
@@ -417,8 +421,6 @@ impl GitOverlay {
         };
 
         let git_path = path_to_git_style_path(relative_path.as_path()).to_owned();
-        // let mut git_path = vec![b'/'];
-        // git_path.extend_from_slice(path_to_git_style_path(relative_path.as_path()).into());
 
         return Ok(git_path);
     }
@@ -547,9 +549,8 @@ impl GitOverlay {
         return files;
     }
 
-    fn add_to_overlay(&self, paths: Vec<PathBuf>) -> Result<(), GitOverlayError> {
+    fn add(&self, paths: Vec<PathBuf>) -> Result<(), GitOverlayError> {
         println!("Adding paths to overlay: {:?}", paths);
-        // TODO: Check .overlayignore patterns, copy files to overlay, stage them
         let base_root = self.base_root();
 
         let mut builder = TrieBuilder::new();
@@ -591,24 +592,12 @@ impl GitOverlay {
         Ok(())
     }
 
-    fn ls_files_overlay(&self, mut paths: Vec<PathBuf>) -> Result<(), GitOverlayError> {
+    fn ls_files(&self, mut paths: Vec<PathBuf>) -> Result<(), GitOverlayError> {
         if paths.len() == 0 {
             paths.push(PathBuf::from_str(".").unwrap());
         }
-        let Ok(repo) = Repository::open_ext(
-            ".",
-            RepositoryOpenFlags::CROSS_FS,
-            &[] as &[&std::ffi::OsStr],
-        ) else {
-            println!("Error: Not a git repository");
-            return Ok(());
-        };
-        let Some(workdir) = repo.workdir() else {
-            println!("Error: Repository has no workdir (likely bare)");
-            return Ok(());
-        };
-        let workdir = normalize_path(workdir);
-        let git_dir = repo.path();
+        let workdir = normalize_path(self.base_root());
+        let git_dir = self.base_repo.path();
         let Ok(overlay_repo) = Repository::open(git_dir.join("overlay")) else {
             println!("Error: No overlay exists");
             return Ok(());
@@ -708,7 +697,7 @@ fn add_to_index(
     Ok(())
 }
 
-fn commit_hook() {
+fn post_commit() {
     println!("Committing with");
     let overlay = GitOverlay::open(".").unwrap();
     let base_hash = overlay
