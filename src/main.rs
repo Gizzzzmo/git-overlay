@@ -1,8 +1,11 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use git2::{ObjectType, TreeWalkMode, TreeWalkResult};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::{os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 mod overlay;
-use overlay::{GitOverlay, GitOverlayError};
+use overlay::{git_style_path_to_path, GitOverlay, GitOverlayError, GitPathRef};
 
 #[derive(Parser, Debug)]
 #[command(name = "git-overlay")]
@@ -143,11 +146,43 @@ fn post_checkout_hook(target: &str, _prev: &str, _branch: bool) -> Result<(), Gi
     let tag_name = format!("refs/tags/{}", target);
     let reference = overlay.overlay_repo.find_reference(&tag_name)?;
     let object = reference.peel(git2::ObjectType::Commit)?;
-    let _commit = object
+    let commit = object
         .into_commit()
         .map_err(|_| git2::Error::from_str("Not a commit"))?;
 
+    println!("{}", commit.id().to_string());
+
     // walk the commit's tree and write the trees files into the base repo
+    commit.tree()?.walk(TreeWalkMode::PreOrder, |x, node| {
+        println!("hi: {} {} {:?}", x, node.name().unwrap(), node.name_bytes());
+        let path = GitPathRef::from(node.name_bytes());
+        let path2 = GitPathRef::from(node.name_bytes());
+        let attribute = node.filemode();
+        let syspath = overlay
+            .base_root()
+            .join(x)
+            .join(git_style_path_to_path(path2));
+
+        if node.kind() == Some(ObjectType::Tree) {
+            println!("alidsjas");
+            _ = std::fs::remove_file(&syspath);
+            _ = std::fs::create_dir(syspath);
+            return TreeWalkResult::Ok;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(attribute as u32)
+            .open(syspath);
+
+        let Ok(bytes) = node.to_object(&overlay.overlay_repo).unwrap().into_blob() else {
+            return TreeWalkResult::Ok;
+        };
+
+        _ = file.unwrap().write_all(bytes.content());
+        return TreeWalkResult::Ok;
+    })?;
 
     Ok(())
 }
