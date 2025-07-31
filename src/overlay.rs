@@ -305,7 +305,7 @@ impl GitOverlay {
     }
 
     /// Get the path to the root directory of the base repository
-    fn base_root(&self) -> &Path {
+    pub fn base_root(&self) -> &Path {
         return match self.base_repo.workdir() {
             Some(path) => path,
             None => unsafe { unreachable_unchecked() },
@@ -316,7 +316,7 @@ impl GitOverlay {
     /// to the given path.
     /// Returns GitOverlayError::PathOutsideRepo if the path does not lie under the base_repo of
     /// this overlay.
-    fn normal_git_path(&self, path: &Path) -> Result<Vec<u8>, GitOverlayError> {
+    pub fn normal_git_path(&self, path: &Path) -> Result<Vec<u8>, GitOverlayError> {
         let path = normalize_path(absolute(path)?.as_path());
         let relative_path = if path.starts_with(self.base_root()) {
             diff_paths(path, self.base_root())
