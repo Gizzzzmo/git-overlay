@@ -7,24 +7,33 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+    rust-overlay,
+  }:
     flake-utils.lib.eachDefaultSystem
-      (system:
-        let
-          overlays = [ (import rust-overlay) ];
-          pkgs = import nixpkgs {
-            inherit system overlays;
-          };
-          rustToolchain = pkgs.pkgsBuildHost.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          nativeBuildInputs = [ rustToolchain ];
-          buildInputs = with pkgs; [ openssl pkg-config ];
-          packages = with pkgs; [rustup];
-        in
-        with pkgs;
-        {
+    (
+      system: let
+        overlays = [(import rust-overlay)];
+        pkgs = import nixpkgs {
+          inherit system overlays;
+        };
+        rustToolchain = pkgs.pkgsBuildHost.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        nativeBuildInputs = [rustToolchain];
+        buildInputs = with pkgs; [openssl pkg-config];
+        packages = with pkgs; [
+          alejandra
+          mdformat
+          python313Packages.mdformat-gfm
+          rustup
+        ];
+      in
+        with pkgs; {
           devShells.default = mkShell {
             inherit buildInputs nativeBuildInputs packages;
           };
         }
-      );
+    );
 }
