@@ -3,5 +3,4 @@
 .overlayignore
 testignore
 .opencode
-CLAUDE.md
-CONTEXT.md
+.ruff_cache
