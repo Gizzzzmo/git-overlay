@@ -83,7 +83,7 @@ fn glob_parse_range(
 
 /// Parses a glob-bracket-expression, and creates the corresponding regex, pushing it to re_pattern.
 /// The starting opening bracket must have already been consumed by the iterator.
-/// Returns true if the iterator starts with a valid glob-bracket-expression.
+/// Returns true if the iterator starts with a complete, and valid glob-bracket-expression.
 /// Otherwise returns false, in which case re_pattern may or may not have been written to.
 /// A valid glob-bracket-expression must be terminated by an unescaped closing bracket ']'
 /// and contain at least one character.

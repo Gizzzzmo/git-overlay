@@ -26,6 +26,9 @@ where
     Ok(io::BufReader::new(file).lines())
 }
 
+/// Parse a pattern file (e.g. .gitignore or .overlayignore) into a vector of tuples
+/// containing the pattern and a boolean indicating whether the pattern is negated (i.e. started
+/// with an exclamation mark).
 fn parse_pattern_file(input: io::Lines<io::BufReader<File>>) -> Vec<(String, bool)> {
     let mut result = Vec::new();
     for line in input {
@@ -69,6 +72,9 @@ fn parse_pattern_file(input: io::Lines<io::BufReader<File>>) -> Vec<(String, boo
     return result;
 }
 
+/// Read a pattern file (e.g. .gitignore or .overlayignore) and convert the patterns into
+/// regexes. The resulting regexes match the combination of the given prefix (verbatim) and the
+/// respective pattern.
 fn regexes_from_pattern_file(path: PathBuf, prefix: &str) -> Vec<(Regex, bool, MatchTarget)> {
     let mut regexes = Vec::new();
 
@@ -104,6 +110,14 @@ fn join_regex_slices<'a>(
     return combined;
 }
 
+/// Check if the given path matches, according to .gitignore rules, the given combination of
+/// patterns (in the form of regexes).
+/// A pattern is a tuple of a regex, a boolean indicating
+/// whether the pattern is negated, and a MatchTarget indicating whether the pattern
+/// matches only files, only directories, or both.
+/// The `is_dir` parameter indicates whether the given path is a directory or not.
+/// A path is considered to be a matched if it matches at least one non-negated pattern at some
+/// point, and does not match a negated pattern at some later point.
 fn path_matches(path: &str, patterns: &[&(Regex, bool, MatchTarget)], is_dir: bool) -> bool {
     let mut matches = false;
     for (regex, negate, match_target) in patterns {
@@ -152,6 +166,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
+/// A handle to a base/overlay git repository pair.
 pub struct GitOverlay {
     pub base_repo: Repository,
     pub overlay_repo: Repository,
@@ -247,6 +262,11 @@ pub fn path_to_git_style_path(path: &Path) -> GitPathRef {
 }
 
 impl GitOverlay {
+    /// Initialize a new overlay within the git repository at (or above) the given `base_repo` path.
+    /// If `remote_url_and_pull` is Some, the overlay will be initialized with a remote named "origin"
+    /// that points to the given `remote_url`. If `pull` is true, the overlay will
+    /// also fetch the remote repository and (todo) checkout its contents for the current commit of
+    /// the base repository.
     pub fn init<P: AsRef<Path>>(
         base_repo: P,
         remote_url_and_pull: Option<(&str, bool)>,
@@ -285,6 +305,10 @@ impl GitOverlay {
         return Ok(overlay);
     }
 
+    /// Get a GitOverlay handle to the existing base/overlay repository pair at (or above) the given
+    /// base repository path.
+    /// In order to be a valid base/overlay pair, the base repository must not be bare and within
+    /// the base repository there must be a directory named "overlay" that contains the overlay.
     pub fn open<P: AsRef<Path>>(base_repo: P) -> Result<GitOverlay, GitOverlayError> {
         let base_repo = Repository::open_ext(
             base_repo,
@@ -313,7 +337,7 @@ impl GitOverlay {
     }
 
     /// Get a normalized git-style path (relative to the root of the base repo of this overlay)
-    /// to the given path.
+    /// to the given path (which is interpreted relative to the current working directory).
     /// Returns GitOverlayError::PathOutsideRepo if the path does not lie under the base_repo of
     /// this overlay.
     pub fn normal_git_path(&self, path: &Path) -> Result<Vec<u8>, GitOverlayError> {
@@ -333,6 +357,13 @@ impl GitOverlay {
         return Ok(git_path);
     }
 
+    /// Get all files in the given directory that fulfill all the following conditions:
+    ///     b) they must not be ignored by the overlay repository (both with respective to the
+    ///        provided `patterns_overlay` patterns and the `.overlayignore` file in the given `dir`)
+    ///     a) if `patterns_ignore` is Some, they must be ignored by the base repository in some
+    ///        .gitignore file underneath the given `dir`
+    ///     c) if `trie_search` is Some, their path must either match a string in the trie being
+    ///        searched or be underneath a directory that matches a string in the trie.
     fn get_matching_files(
         &self,
         dir: &Path,
@@ -457,6 +488,10 @@ impl GitOverlay {
         return files;
     }
 
+    /// Recursively add all files under the given paths, that are
+    ///     a) .gitignored by the base repository
+    ///     b) not .overlayignored by the overlay repository
+    /// Paths are interpreted relative to the current working directory.
     pub fn add(&self, paths: Vec<PathBuf>) -> Result<(), GitOverlayError> {
         println!("Adding paths to overlay: {:?}", paths);
         let base_root = self.base_root();
@@ -570,6 +605,7 @@ impl GitOverlay {
     }
 }
 
+/// Add the file at the path `file` to the index of the overlay repository at the given `git_path`.
 fn add_to_index(
     index: &mut git2::Index,
     git_path: GitPathRef,
